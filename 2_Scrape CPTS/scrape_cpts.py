@@ -79,7 +79,7 @@ RETRY_429_WAIT      = 60     # secondes d'attente sur 429
 RETRY_429_MAX       = 5      # tentatives max
 
 # Seuil pour décider si le DOM est "pauvre" → fallback Vision
-MIN_TEXT_LENGTH     = 150    # caractères minimum pour considérer le texte suffisant
+MIN_TEXT_LENGTH     = 80     # caractères minimum pour considérer le texte suffisant
 
 # Mots-clés pages équipe (URLs)
 EQUIPE_KW = [
@@ -92,11 +92,10 @@ EQUIPE_KW = [
 
 # Mots-clés dans le TEXTE des pages pour détecter une page équipe
 EQUIPE_TEXT_KW = [
-    "président", "vice-président", "trésorier", "secrétaire",
-    "bureau", "membres du bureau", "conseil d'administration",
-    "gouvernance", "notre équipe", "l'équipe", "membres du ca",
-    "administrateur", "co-président", "co-présidente",
-    "qui sommes-nous", "qui sommes nous",
+    "membres du bureau", "conseil d'administration",
+    "notre équipe", "l'équipe dirigeante",
+    "président", "trésorier", "secrétaire",
+    "membres du ca", "administrateur", "co-président",
 ]
 
 # Mots-clés pages projets
@@ -346,6 +345,10 @@ def normalize_url(raw: str) -> str:
 
 def score_url(url: str, keywords: list) -> int:
     url_lower = url.lower()
+    # Ignorer les URLs d'articles (chemin trop long = blog post)
+    path = urlparse(url).path.strip("/")
+    if len(path.split("-")) > 6:  # URL type article de blog
+        return 0
     return sum(1 for k in keywords if k in url_lower)
 
 
@@ -588,7 +591,7 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
                     await asyncio.sleep(1)
                     cand_text = await page.evaluate("() => document.body.innerText")
                     cand_lower = cand_text.lower()
-                    if any(kw in cand_lower for kw in EQUIPE_TEXT_KW):
+                    if sum(1 for kw in EQUIPE_TEXT_KW if kw in cand_lower) >= 2:
                         equipe_url = candidate
                         log.info(f"[{code}] Page équipe trouvée par texte : {candidate}")
                         break
