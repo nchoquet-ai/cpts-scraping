@@ -94,7 +94,9 @@ EQUIPE_KW = [
 EQUIPE_TEXT_KW = [
     "président", "vice-président", "trésorier", "secrétaire",
     "bureau", "membres du bureau", "conseil d'administration",
-    "gouvernance", "notre équipe", "l'équipe",
+    "gouvernance", "notre équipe", "l'équipe", "membres du ca",
+    "administrateur", "co-président", "co-présidente",
+    "qui sommes-nous", "qui sommes nous",
 ]
 
 # Mots-clés pages projets
@@ -576,8 +578,10 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
             # Pages candidates = liens courts (pas d'articles, pas de /20xx/)
             candidates = [l for l in all_links
                          if l != url
-                         and not any(x in l for x in ["/20", "pdf", "jpg", "png", "wp-content"])
-                         and len(l.replace(url, "").strip("/").split("/")) <= 2][:8]
+                         and not any(x in l for x in ["pdf", "jpg", "png", "wp-content",
+                                                       "mentions", "confidential", "login",
+                                                       "inscription", "adherere", "don"])
+                         and len(l.replace(url, "").strip("/").split("/")) <= 2][:15]
             for candidate in candidates:
                 try:
                     await page.goto(candidate, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
@@ -596,9 +600,11 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
                 await asyncio.sleep(1)
 
         equipe_url = equipe_url or url
+        log.info(f"[{code}] Page équipe retenue : {equipe_url}")
         if equipe_url != url:
             equipe_text, equipe_ss = await get_page_content(page, equipe_url)
         else:
+            log.warning(f"[{code}] ⚠️ Fallback home — page équipe non trouvée")
             equipe_text, equipe_ss = home_text, home_ss
 
         # Sauvegarder screenshot si Vision nécessaire
@@ -698,14 +704,19 @@ Réponds UNIQUEMENT avec ce JSON (sans markdown) :
 }}
 
 Règles :
-- equipe : uniquement les membres du bureau/CA (président, vice-président, trésorier, secrétaire, administrateurs)
-- adherents : cherche des chiffres comme "200 professionnels", "80 adhérents", "320 membres"
+- equipe : extrais TOUS les membres du bureau/CA visibles (président, vice-président, trésorier, secrétaire, administrateurs)
+  * Cherche dans toutes les sections : "Les membres du bureau", "Notre équipe", "Gouvernance", "Bureau", "L'équipe", "Conseil d'administration"
+  * Format du texte souvent : "Fonction\nPrénom Nom" ou "Prénom Nom\nFonction" ou "M./Mme/Dr Prénom NOM - Fonction"
+  * Si civilité absente, déduis-la du prénom (Marie → Mme, Jean → M.)
+  * Si spécialité absente, laisse null (ne pas inventer)
+  * Inclus les administrateurs même sans spécialité mentionnée
+- adherents : cherche "X adhérents", "X professionnels", "X membres", "X soignants" — prends le nombre le plus récent
 - projets : uniquement les projets concrets avec un titre identifiable
 - actus : les 5 plus récentes uniquement
 - mots_cles_projets : choisis UNIQUEMENT parmi les thématiques listées ci-dessous (plusieurs possibles)
 - mots_cles_actus : idem, uniquement parmi les thématiques listées ci-dessous
 - Si une info est absente, mets null ou liste vide []
-- Ne jamais inventer d'informations
+- Ne jamais inventer de noms ou fonctions
 
 === THÉMATIQUES AUTORISÉES POUR LES PROJETS ===
 {thematiques_projets}
