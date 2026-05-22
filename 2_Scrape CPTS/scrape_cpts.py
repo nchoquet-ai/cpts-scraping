@@ -345,9 +345,11 @@ def normalize_url(raw: str) -> str:
 
 def score_url(url: str, keywords: list) -> int:
     url_lower = url.lower()
-    # Ignorer les URLs d'articles (chemin trop long = blog post)
-    path = urlparse(url).path.strip("/")
-    if len(path.split("-")) > 6:  # URL type article de blog
+    # Ignorer les URLs d'articles : le DERNIER segment du chemin a trop de tirets
+    # Ex. article : /la-cpts-des-3-provinces-forme-les-professionnels-… (14 tirets)
+    # Ex. valide  : /qui-sommes-nous/conseil-d-administration-et-bureau  (4 tirets)
+    last_segment = urlparse(url).path.strip("/").split("/")[-1]
+    if len(last_segment.split("-")) > 6:  # slug trop long = article de blog
         return 0
     return sum(1 for k in keywords if k in url_lower)
 
