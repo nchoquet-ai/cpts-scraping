@@ -1,0 +1,268 @@
+================================================================================
+  VÉRIFICATION ET COMPLÉTION DES SITES INTERNET CPTS
+  Documentation du processus — verify_and_complete_sites.py
+  Dernière mise à jour : mai 2026
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  VUE D'ENSEMBLE
+────────────────────────────────────────────────────────────────────────────────
+
+Le script prend en entrée un fichier Excel contenant la liste des CPTS et leurs
+sites internet (certains renseignés, d'autres vides ou incorrects), et produit
+un fichier Excel enrichi et coloré avec :
+
+  - Le statut de chaque URL (valide, morte, protégée, redirigée...)
+  - La confirmation que le site correspond bien à la bonne CPTS
+  - Les sites trouvés automatiquement pour les CPTS sans URL,
+    avec URL morte, ou avec un mauvais site
+
+Le script est conçu pour tourner 2 à 3 fois par an sur l'ensemble des ~852 CPTS.
+Durée estimée sur 852 CPTS : environ 1h10.
+
+Le traitement se déroule en 3 phases successives.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  AVANT DE LANCER LE SCRIPT
+────────────────────────────────────────────────────────────────────────────────
+
+Prérequis :
+  1. Python 3.10 ou supérieur installé (avec la case "Add to PATH" cochée)
+  2. Les bibliothèques installées (une seule fois) :
+       pip install anthropic httpx pandas openpyxl tqdm
+  3. Une clé API Anthropic définie :
+       Windows  : set ANTHROPIC_API_KEY=sk-ant-...
+       Mac/Linux: export ANTHROPIC_API_KEY=sk-ant-...
+
+  La clé API est valable toute la session CMD. Si vous fermez et rouvrez CMD,
+  vous devez la redéfinir. Pour éviter cela, ajoutez-la en variable
+  d'environnement permanente dans Windows :
+  Panneau de configuration → Système → Variables d'environnement → Nouvelle
+
+Format du fichier Excel source :
+  Le fichier doit contenir au minimum deux colonnes :
+  - Une colonne "Nom"  : ex. "Label_CPTS_OPEX", "Nom de la CPTS"...
+  - Une colonne "Site" : ex. "Site internet", "URL", "site_web"...
+  - Optionnel : une colonne "Code_CPTS" pour identifier chaque CPTS
+
+  Les URLs peuvent être incomplètes, le script les normalise automatiquement :
+    "cpts-solidar.fr"      → "https://cpts-solidar.fr"
+    "www.cptslyonnord.org" → "https://www.cptslyonnord.org"
+    "nan", "-", ""         → ignoré (traité comme vide)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 1 — VÉRIFICATION HTTP DES URLS EXISTANTES (~3 min)
+────────────────────────────────────────────────────────────────────────────────
+
+Objectif : tester si chaque URL renseignée répond correctement.
+
+Fonctionnement :
+  - 20 URLs testées simultanément (parallélisme)
+  - Chaque URL reçoit jusqu'à 2 tentatives en cas d'erreur réseau
+  - Le script suit automatiquement les redirections
+  - Si une URL répond 403 (accès refusé) sans "www", le script teste
+    automatiquement la version avec "www" avant de conclure
+
+Résultats possibles pour chaque URL :
+
+  ok        → Le site répond normalement (code HTTP 200)
+  redirect  → Le site répond mais l'URL a changé (ex: http → https)
+              La nouvelle URL finale est conservée
+  protégé   → Le site existe mais bloque les robots (code HTTP 403)
+              L'URL est conservée — vérification manuelle recommandée
+  dead      → Le site ne répond pas (code 404, 500, timeout...)
+              Une recherche sera lancée en phase 3
+  vide      → Aucune URL renseignée dans le fichier source
+
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 2 — VÉRIFICATION DE CORRESPONDANCE via Claude AI (~35 min)
+────────────────────────────────────────────────────────────────────────────────
+
+Objectif : confirmer que chaque site fonctionnel correspond bien à la bonne CPTS.
+           Un site peut être en ligne mais appartenir à une autre organisation.
+
+Fonctionnement :
+  - Uniquement pour les URLs avec statut "ok", "redirect" ou "protégé"
+  - Le script télécharge le texte visible de chaque page d'accueil
+  - Il envoie ce texte à Claude (API Anthropic) avec la question :
+    "Ce site correspond-il bien à la CPTS [nom] ?"
+  - 3 appels Claude sont faits simultanément
+  - Les sites protégés (403) sont automatiquement marqués "protégé"
+    car leur contenu n'est pas lisible par le script
+  - Le parsing de la réponse Claude est robuste (4 niveaux de fallback)
+    pour éviter les erreurs si Claude répond en texte libre plutôt qu'en JSON
+
+Résultats possibles :
+
+  oui       → Claude confirme que le site est bien celui de cette CPTS
+  non       → Le site est fonctionnel mais appartient à une autre organisation
+              → Une recherche sera automatiquement lancée en phase 3
+  incertain → Le site parle de santé dans la zone mais n'est pas clairement
+              identifié comme cette CPTS spécifique
+  protégé   → Site bloquant les robots, impossible à lire automatiquement
+              → Vérification manuelle dans votre navigateur recommandée
+
+
+────────────────────────────────────────────────────────────────────────────────
+  PAUSE ENTRE PHASES 2 ET 3 (~2 min)
+────────────────────────────────────────────────────────────────────────────────
+
+Le script attend automatiquement 2 minutes entre la phase 2 et la phase 3.
+Cette pause est nécessaire pour laisser le quota d'API Anthropic se réinitialiser
+(limite de 30 000 tokens par minute) et éviter les erreurs 429.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 3 — RECHERCHE DES SITES MANQUANTS via Claude AI + web (~30 min)
+────────────────────────────────────────────────────────────────────────────────
+
+Objectif : trouver automatiquement le site officiel des CPTS qui n'en ont pas.
+
+Cette phase est déclenchée pour 4 cas :
+  1. CPTS sans URL dans le fichier source
+  2. CPTS dont l'URL est morte (statut "dead")
+  3. CPTS dont l'URL ne correspond pas à la bonne organisation ("non")
+  4. CPTS marquées "non trouvé" lors d'un run précédent (retraitées automatiquement)
+
+Note : les sites "protégé" (403) sont EXCLUS — leur URL existe, on la conserve.
+
+Fonctionnement :
+  - Traitement séquentiel : une CPTS à la fois
+  - 7 secondes de pause entre chaque appel (respect du rate limit)
+  - Claude effectue une recherche web et retourne l'URL officielle trouvée
+  - En cas d'erreur 429, le script attend 60 secondes et réessaie
+    (jusqu'à 5 tentatives par CPTS)
+  - Parsing robuste de la réponse en 4 niveaux de fallback
+  - L'ancienne URL incorrecte est conservée dans la colonne "Ancienne URL"
+  - Un checkpoint est sauvegardé toutes les 25 CPTS et à la fin
+
+Résultats possibles :
+
+  trouvé (haute)   → Site trouvé avec forte confiance     → ligne bleue
+  trouvé (moyenne) → Site trouvé, vérification conseillée → ligne bleue
+  trouvé (faible)  → Site trouvé avec doute               → ligne bleue
+  non trouvé       → Aucun site identifiable               → ligne grise
+
+
+────────────────────────────────────────────────────────────────────────────────
+  REPRISE APRÈS INTERRUPTION
+────────────────────────────────────────────────────────────────────────────────
+
+Si le script est interrompu (coupure réseau, fermeture accidentelle...) :
+  - Un fichier "Output/checkpoint.csv" est sauvegardé régulièrement
+  - Relancez simplement avec --resume :
+
+      python verify_and_complete_sites.py --input "Input\\fichier.xlsx" --resume
+
+  - Le script reprend exactement là où il s'était arrêté
+  - Un fichier de log "Output/run.log" conserve l'historique complet
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FICHIERS PRODUITS
+────────────────────────────────────────────────────────────────────────────────
+
+  Output/CPTS_sites_verified.xlsx   → Fichier Excel coloré (résultat principal)
+  Output/CPTS_sites_verified.csv    → Même données au format CSV
+  Output/checkpoint.csv             → Sauvegarde intermédiaire (reprise possible)
+  Output/run.log                    → Journal complet de l'exécution
+
+
+────────────────────────────────────────────────────────────────────────────────
+  CODE COULEUR DU FICHIER EXCEL
+────────────────────────────────────────────────────────────────────────────────
+
+  VERT         → Site confirmé (URL valide + correspond à la bonne CPTS)
+  VERT PÂLE    → URL valide mais non vérifiée (clé API absente)
+  ORANGE       → Site protégé (403) — vérifier manuellement dans le navigateur
+  ROSE         → Correspondance incertaine — vérifier manuellement
+  ROUGE VIF    → Mauvaise CPTS (site fonctionnel mais pas la bonne organisation)
+  ROUGE PÂLE   → URL morte (site inaccessible)
+  BLEU PÂLE    → Nouveau site trouvé par recherche — à confirmer manuellement
+  GRIS         → Aucun site trouvé malgré la recherche
+
+
+────────────────────────────────────────────────────────────────────────────────
+  COLONNES DU FICHIER EXCEL
+────────────────────────────────────────────────────────────────────────────────
+
+  Code CPTS                      Code interne de la CPTS (ex: ARA-25)
+  Nom CPTS                       Nom officiel de la CPTS
+  Site source (fichier original) URL telle qu'elle était dans votre fichier source
+                                 (immuable — jamais modifiée par le script)
+  Site internet (vérifié/trouvé) URL après vérification ou après recherche
+  Statut HTTP                    ok / redirect / protégé / dead / trouvé / non trouvé
+  URL finale                     URL après redirection automatique
+  Code HTTP                      Code de réponse du serveur (200, 301, 403, 404...)
+  Correspondance CPTS            oui / non / incertain / protégé / à vérifier
+  Raison                         Explication courte de Claude
+  Source recherche               Comment Claude a trouvé le site (phase 3)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  COMMANDES DISPONIBLES
+────────────────────────────────────────────────────────────────────────────────
+
+  Lancement complet sur toutes les CPTS :
+    python verify_and_complete_sites.py --input "Input\Liste des CPTS avec site.xlsx"
+
+  Test sur les N premières lignes :
+    python verify_and_complete_sites.py --input "Input\\fichier.xlsx" --limit 50
+
+  Reprendre après une interruption :
+    python verify_and_complete_sites.py --input "Input\\fichier.xlsx" --resume
+
+  Phase 1 & 2 uniquement (vérification, sans recherche) :
+    python verify_and_complete_sites.py --input "Input\\fichier.xlsx" --verify-only
+
+  Phase 3 uniquement (recherche des manquants, sans revérifier les URLs) :
+    python verify_and_complete_sites.py --input "Input\\fichier.xlsx" --search-only
+
+
+────────────────────────────────────────────────────────────────────────────────
+  DURÉE ET COÛT ESTIMÉS (sur 852 CPTS)
+────────────────────────────────────────────────────────────────────────────────
+
+  Phase 1 — Vérification HTTP     :  ~3 minutes   (20 en parallèle)
+  Phase 2 — Correspondance Claude :  ~35 minutes  (3 en parallèle)
+  Pause rate limit                 :  ~2 minutes
+  Phase 3 — Recherche manquants   :  ~30 minutes  (~250 CPTS × 7s)
+                                    ─────────────
+  Total estimé                    :  ~1h10
+
+  Coût API Anthropic estimé       :  ~3 à 5 USD pour les 852 CPTS complètes
+
+
+────────────────────────────────────────────────────────────────────────────────
+  EN CAS DE PROBLÈME
+────────────────────────────────────────────────────────────────────────────────
+
+  "ANTHROPIC_API_KEY manquante"
+    → Redéfinir la clé : set ANTHROPIC_API_KEY=sk-ant-...
+    → Vérifier        : echo %ANTHROPIC_API_KEY%
+
+  "ModuleNotFoundError"
+    → Réinstaller : pip install anthropic httpx pandas openpyxl tqdm
+
+  "FileNotFoundError" sur le fichier Excel
+    → Vérifier que le fichier est dans le même dossier que le script
+    → Utiliser des guillemets si le nom contient des espaces :
+      --input "Liste des CPTS avec site.xlsx"
+
+  Erreur 429 (rate limit dépassé)
+    → Le script gère automatiquement les 429 avec retry et attente de 60s
+    → Si les erreurs persistent, augmentez SEARCH_RETRY_WAIT à 90 dans le script
+    → Ou demandez une augmentation de limite sur console.anthropic.com
+
+  Le script s'interrompt en cours de route
+    → Relancer avec --resume, le checkpoint reprend automatiquement
+
+  Sites marqués "non trouvé" après un premier run
+    → Ils sont automatiquement retraités au prochain run complet
+    → Ou relancer uniquement la phase 3 : --search-only
+
+================================================================================

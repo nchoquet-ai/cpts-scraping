@@ -1,0 +1,87 @@
+# Résumé de contexte — Projet CPTS
+# À copier-coller au début d'une nouvelle conversation Claude
+
+---
+
+## Contexte du projet
+
+Je travaille sur un projet de collecte automatique de données concernant les
+~852 CPTS (Communautés Professionnelles Territoriales de Santé) françaises.
+L'objectif est de constituer une base de données structurée sur ces structures
+de santé, utilisable 2 à 3 fois par an.
+
+Le projet est développé en Python, lancé depuis un terminal Windows (CMD).
+Structure du projet :
+  D:\SERVER@OPEXSTUDIO\OPEXSTUDIO\OPEXDATA\1_SOURCES\CPTS\SCRAP AI
+  ├── CONTEXTE_NOUVELLE_CONVERSATION.txt
+  ├── 1_Collecte des sites internet\
+  │   ├── verify_and_complete_sites.py
+  │   ├── verify_and_complete_sites_PROCESS.txt
+  │   ├── Input\  (fichiers Excel source)
+  │   └── Output\ (résultats, checkpoint, logs)
+  └── 2_Scrape CPTS\
+      ├── scrape_cpts.py
+      ├── scrape_cpts_PROCESS.txt
+      └── Output\ (cpts.db, CSV, raw_pages)
+
+## Stack technique
+
+- Python 3.14 (Windows)
+- API Anthropic (Claude Sonnet 4.6) — clé API définie en variable d'environnement
+- Playwright (scraping web)
+- SQLite (stockage des données scrapées)
+- pandas, openpyxl, httpx, tqdm
+
+## Fichier source
+
+Fichier Excel : "Liste des CPTS avec site.xlsx"
+Colonnes : Code_CPTS | Label_CPTS_OPEX | Site internet
+
+## Deux scripts en production
+
+### 1. verify_and_complete_sites.py
+Vérifie et complète les URLs des sites CPTS en 3 phases :
+- Phase 1 : vérification HTTP de toutes les URLs (ok/dead/protégé/redirect)
+- Phase 2 : vérification via Claude que le site correspond bien à la CPTS
+- Phase 3 : recherche Claude + web search pour les CPTS sans site ou avec mauvais site
+
+Points importants :
+- Parsing JSON robuste en 4 niveaux (Claude répond parfois en texte libre)
+- Retry automatique sur erreur 429 (5 tentatives, 60s d'attente)
+- Pause 120s entre phase 2 et phase 3 (reset rate limit)
+- Les sites 403 testent automatiquement la version www
+- Checkpoint toutes les 25 CPTS + à la fin
+- Colonne "site_source" conserve l'URL originale immuable
+- Les "non trouvé" des runs précédents sont retraités automatiquement
+
+Commande test : python verify_and_complete_sites.py --input "Input\\Liste des CPTS avec site.xlsx" --limit 50
+Commande complète : python verify_and_complete_sites.py --input "Input\\Liste des CPTS avec site.xlsx"
+Reprise : python verify_and_complete_sites.py --input "Input\\Liste des CPTS avec site.xlsx" --resume
+
+### 2. scrape_cpts.py
+Scrape les sites et extrait les données via Claude. Architecture SQLite (output/cpts.db).
+Phase 1 (--scrape) : scraping Playwright, stockage texte brut en base
+Phase 2 (--extract) : extraction Claude des infos structurées
+Export (--export) : génération CSV final
+
+Données extraites : équipe dirigeante, projets, missions, coordonnées, communes, etc.
+
+## Prochaines étapes prévues
+
+1. Lancer verify_and_complete_sites.py sur les 852 CPTS complètes
+2. Lancer scrape_cpts.py sur les 852 CPTS pour extraire les données
+3. Ajouter collecte des actualités (Niveau 1 : pages actu + Niveau 2 : recherche Claude)
+4. Ajouter collecte des partenariats (MSP, centres de santé...)
+5. Croisement avec base RPPS (code RPPS, spécialité, lieu d'exercice)
+
+## Points de vigilance
+
+- Rate limit Anthropic : 30 000 tokens/minute (Tier 1)
+- Certains sites CPTS bloquent les robots (403) — marqués "protégé" dans l'Excel
+- CONCURRENCY_CLAUDE = 2 en phase 2, séquentiel en phase 3
+- Le scraping peut prendre 3-6h pour 852 CPTS
+
+## Conformité RGPD
+
+Données professionnelles publiques. Base légale : intérêt légitime (Art. 6.1.f).
+DPA Anthropic automatiquement inclus dans les CGU commerciales (CCT UE).

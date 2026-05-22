@@ -1,0 +1,233 @@
+================================================================================
+  SCRAPING ET EXTRACTION DES DONNÉES CPTS
+  Documentation du processus — scrape_cpts.py
+  Dernière mise à jour : mai 2026
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  VUE D'ENSEMBLE
+────────────────────────────────────────────────────────────────────────────────
+
+Le script visite les sites web des CPTS, extrait le texte brut des pages
+pertinentes, puis utilise Claude pour structurer les informations en données
+exploitables (équipe dirigeante, projets, coordonnées, etc.).
+
+Architecture clé : scraping et extraction sont séparés.
+  - Le scraping (lent, dépend du réseau) est fait une seule fois
+  - L'extraction Claude (rapide, modifiable) peut être relancée à volonté
+  - Toutes les données sont stockées dans une base SQLite locale
+
+Ce script est à lancer APRÈS avoir vérifié et complété les URLs avec
+verify_and_complete_sites.py.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  AVANT DE LANCER LE SCRIPT
+────────────────────────────────────────────────────────────────────────────────
+
+Prérequis :
+  1. Python 3.10 ou supérieur
+  2. Les bibliothèques installées :
+       pip install -r requirements.txt
+  3. Le navigateur Chromium installé (une seule fois) :
+       python -m playwright install chromium
+  4. Une clé API Anthropic :
+       Windows  : set ANTHROPIC_API_KEY=sk-ant-...
+       Mac/Linux: export ANTHROPIC_API_KEY=sk-ant-...
+
+Format du fichier Excel source :
+  Colonnes acceptées (noms flexibles) :
+  - Nom   : "nom", "Label_CPTS_OPEX", "Nom de la CPTS"...
+  - URL   : "site", "url", "site_web", "Site internet"...
+  - Code  : "Code_CPTS" (optionnel, conservé dans l'export)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  ARCHITECTURE DE LA BASE SQLITE
+────────────────────────────────────────────────────────────────────────────────
+
+Toutes les données sont stockées dans Output/cpts.db (un seul fichier).
+Pas de serveur, pas d'installation — juste un fichier sur votre disque.
+
+  Table "cpts"
+    id, nom, site_web, meta_json (colonnes supplémentaires du fichier source)
+
+  Table "pages"
+    id, cpts_id, url, texte (texte brut scraped), scraped_at
+    → Le texte est conservé indéfiniment pour permettre de re-extraire
+      sans rescaper les sites
+
+  Table "extractions"
+    id, cpts_id, equipe_json, projets, missions, telephone, email,
+    adresse, communes, professionnels, date_creation, notes,
+    model, extracted_at
+
+Pour explorer la base visuellement sans code :
+  → Télécharger "DB Browser for SQLite" (gratuit)
+  → Ouvrir le fichier Output/cpts.db
+
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 1 — SCRAPING DES SITES (~3-6h pour 852 CPTS)
+────────────────────────────────────────────────────────────────────────────────
+
+Objectif : visiter chaque site CPTS et stocker le texte brut en base.
+
+Fonctionnement :
+  - Playwright pilote un navigateur Chromium en arrière-plan
+  - 4 sites sont visités simultanément (parallélisme)
+  - Pour chaque site, le script visite la page d'accueil puis les sous-pages
+    dont l'URL contient des mots-clés pertinents :
+    equipe, gouvernance, president, projet, mission, contact, actualite...
+  - Maximum 6 sous-pages par CPTS
+  - Le texte visible est extrait (sans scripts, styles, bannières cookies)
+  - Si une CPTS est déjà en base, elle est ignorée (pas de re-scraping)
+
+Commandes :
+  # Depuis un fichier Excel
+  python scrape_cpts.py --scrape --input "Input\\Liste des CPTS avec site.xlsx"
+
+  # Test sur les 9 CPTS intégrées
+  python scrape_cpts.py --scrape --test
+
+  # Limiter à N CPTS (test)
+  python scrape_cpts.py --scrape --input "Input\\fichier.xlsx" --limit 20
+
+  # Reprendre là où on s'était arrêté
+  python scrape_cpts.py --scrape --input "Input\\fichier.xlsx" --resume
+
+
+────────────────────────────────────────────────────────────────────────────────
+  PHASE 2 — EXTRACTION VIA CLAUDE (~10-20 min pour 852 CPTS)
+────────────────────────────────────────────────────────────────────────────────
+
+Objectif : extraire les informations structurées depuis le texte brut stocké.
+
+Fonctionnement :
+  - Claude reçoit le texte brut de toutes les pages scrapées d'une CPTS
+  - Il retourne un JSON structuré avec les informations demandées
+  - Traitement séquentiel pour respecter le rate limit
+  - Seules les CPTS pas encore extraites sont traitées (sauf --rerun)
+
+Informations extraites :
+  - equipe_dirigeante : liste [{role, nom, profession}]
+  - projets           : liste de programmes de santé
+  - missions          : liste de missions déclarées
+  - telephone, email, adresse
+  - communes_couvertes
+  - professionnels_membres
+  - date_creation
+  - notes
+
+Pour ajouter un nouveau champ :
+  1. Modifiez EXTRACTION_PROMPT dans scrape_cpts.py
+  2. Relancez : python scrape_cpts.py --extract --rerun
+  Le texte brut est déjà en base — pas besoin de rescaper les sites.
+
+Commandes :
+  # Extraire les nouvelles CPTS (pas encore extraites)
+  python scrape_cpts.py --extract
+
+  # Re-extraire toutes les CPTS (prompt modifié)
+  python scrape_cpts.py --extract --rerun
+
+
+────────────────────────────────────────────────────────────────────────────────
+  EXPORT CSV
+────────────────────────────────────────────────────────────────────────────────
+
+Commande :
+  python scrape_cpts.py --export
+
+Produit : Output/cpts_data.csv
+
+Colonnes du CSV final :
+  nom                   Nom officiel de la CPTS
+  site_web              URL du site officiel
+  region / departement  Localisation (si dans le fichier source)
+  telephone / email     Coordonnées professionnelles
+  adresse               Adresse du siège
+  president             Nom + profession du président
+  directeur             Nom + profession du directeur
+  equipe_dirigeante     Équipe complète (pipe-séparée)
+  projets               Projets de santé (pipe-séparés)
+  missions              Missions déclarées
+  communes_couvertes    Territoire couvert
+  professionnels_membres Nombre de professionnels
+  date_creation         Année de création
+  notes                 Autres informations
+  pages_scrapees        Nombre de pages visitées
+  extracted_at          Date de l'extraction
+
+
+────────────────────────────────────────────────────────────────────────────────
+  VÉRIFIER L'ÉTAT DE LA BASE
+────────────────────────────────────────────────────────────────────────────────
+
+Commande :
+  python scrape_cpts.py --status
+
+Affiche :
+  - Nombre de CPTS en base
+  - Nombre de CPTS scrapées (avec pages)
+  - Nombre de CPTS extraites
+  - Reste à scraper / extraire
+  - Date et nom du dernier scraping
+
+Requêtes SQL utiles (sqlite3 en ligne de commande) :
+  # Voir les CPTS avec email renseigné
+  sqlite3 Output/cpts.db "SELECT c.nom, e.email FROM extractions e JOIN cpts c ON c.id=e.cpts_id WHERE e.email IS NOT NULL"
+
+  # Exporter toutes les extractions en CSV
+  sqlite3 -csv -header Output/cpts.db "SELECT * FROM extractions" > extractions.csv
+
+  # Voir combien de pages scrapées par CPTS
+  sqlite3 Output/cpts.db "SELECT c.nom, COUNT(p.id) nb FROM pages p JOIN cpts c ON c.id=p.cpts_id GROUP BY c.id ORDER BY nb DESC LIMIT 20"
+
+
+────────────────────────────────────────────────────────────────────────────────
+  TOUTES LES COMMANDES
+────────────────────────────────────────────────────────────────────────────────
+
+  python scrape_cpts.py --scrape --input "Input\\fichier.xlsx"    Charger + scraper
+  python scrape_cpts.py --scrape --test                  Test 9 CPTS intégrées
+  python scrape_cpts.py --scrape --limit N               Limiter à N CPTS
+  python scrape_cpts.py --scrape --resume                Reprendre le scraping
+  python scrape_cpts.py --extract                        Extraire (nouvelles)
+  python scrape_cpts.py --extract --rerun                Re-extraire toutes
+  python scrape_cpts.py --export                         Exporter en CSV
+  python scrape_cpts.py --status                         État de la base
+
+
+────────────────────────────────────────────────────────────────────────────────
+  DURÉE ET COÛT ESTIMÉS (852 CPTS)
+────────────────────────────────────────────────────────────────────────────────
+
+  Phase 1 — Scraping    : 3 à 6 heures (selon débit réseau)
+  Phase 2 — Extraction  : 15 à 20 minutes
+  Export CSV            : < 1 minute
+
+  Coût API Anthropic : ~1 à 2 USD pour les 852 CPTS
+
+
+────────────────────────────────────────────────────────────────────────────────
+  EN CAS DE PROBLÈME
+────────────────────────────────────────────────────────────────────────────────
+
+  "ANTHROPIC_API_KEY manquante"
+    → set ANTHROPIC_API_KEY=sk-ant-...
+
+  "playwright not found" ou "chromium not found"
+    → python -m playwright install chromium
+
+  Une CPTS a 0 page scrapée
+    → Son site bloque les robots ou est trop lent
+    → Le texte sera vide, l'extraction retournera des champs null
+    → Vérifiez manuellement le site dans votre navigateur
+
+  Relancer uniquement l'extraction après modification du prompt
+    → python scrape_cpts.py --extract --rerun
+    → Le scraping n'est PAS relancé — le texte brut est déjà en base
+
+================================================================================
