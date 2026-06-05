@@ -746,31 +746,58 @@ Si tu ne peux pas lire clairement un nom ou une fonction, omets ce membre.
 """
 
 
-def _call_claude_text(client, nom, pages: dict) -> dict:
-    """Appel Claude extraction texte avec retry 429."""
-    equipe_text  = pages.get("equipe",  "")[:6000]
-    projets_text = pages.get("projets", "")[:3000]
-    home_text    = pages.get("home",    "")[:4000]  # 4000 pour capturer les chiffres en bas de page
-    actu_text    = pages.get("actus",   "")[:2000]
-
-    # Formater les thématiques pour le prompt
+def _call_claude_text(client, nom, pages_rows: list) -> dict:
+    """
+    Option C — Appel Claude avec toutes les pages agrégées.
+    pages_rows : liste de (page_type, url, dom_text, screenshot_path)
+    """
+    # Formater les thématiques
     them_proj = THEMATIQUES.get("projets", [])
     them_actu = THEMATIQUES.get("actus",   [])
     them_proj_str = "\n".join(
         f"- {t['label']} (mots-clés : {', '.join(t['keywords'][:5])})"
         for t in them_proj
-    ) or "(aucune thématique configurée — utilise des mots-clés libres)"
+    ) or "(aucune thématique configurée)"
     them_actu_str = "\n".join(
         f"- {t['label']} (mots-clés : {', '.join(t['keywords'][:5])})"
         for t in them_actu
-    ) or "(aucune thématique configurée — utilise des mots-clés libres)"
+    ) or "(aucune thématique configurée)"
+
+    # Construire le contenu agrégé de toutes les pages
+    # Budget tokens : ~12000 chars total répartis entre les pages
+    pages_content_parts = []
+    
+    # Home en priorité (chiffres clés)
+    home_rows = [r for r in pages_rows if r[0] == "home"]
+    other_rows = [r for r in pages_rows if r[0] != "home"]
+    
+    char_budget = 12000
+    
+    for ptype, purl, ptext, _ in (home_rows + other_rows):
+        if not ptext or not ptext.strip():
+            continue
+        # Budget par page : plus pour home et equipe
+        if ptype == "home":
+            limit = 3000
+        elif ptype in ("equipe", "other"):
+            limit = 2500
+        else:
+            limit = 1500
+        
+        truncated = ptext.strip()[:limit]
+        pages_content_parts.append(
+            f"--- PAGE : {ptype.upper()} ({purl}) ---\n{truncated}"
+        )
+        char_budget -= len(truncated)
+        if char_budget <= 0:
+            break
+
+    pages_content = "\n\n".join(pages_content_parts) if pages_content_parts else "(aucun contenu disponible)"
 
     prompt = EXTRACT_PROMPT.format(
         nom=nom,
-        equipe_text=equipe_text or "(non disponible)",
-        projets_text=projets_text or "(non disponible)",
-        home_text=home_text or "(non disponible)",
-        actu_text=actu_text or "(non disponible)",
+        nb_pages=len(pages_content_parts),
+        pages_content=pages_content,
         thematiques_projets=them_proj_str,
         thematiques_actus=them_actu_str,
     )
@@ -779,7 +806,7 @@ def _call_claude_text(client, nom, pages: dict) -> dict:
         try:
             resp = client.messages.create(
                 model=CLAUDE_MODEL,
-                max_tokens=2000,
+                max_tokens=2500,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = resp.content[0].text.strip()
@@ -885,31 +912,39 @@ Ne donne aucune explication. Exemple de réponse : contact@cpts-exemple.fr"""
     return None
 
 def extract_one(client, code: str, nom: str) -> bool:
-    """Extrait les données d'une CPTS depuis la DB (ouvre sa propre connexion — thread-safe)."""
+    """
+    Option C — Extrait les données d'une CPTS.
+    Passe TOUTES les pages à Claude en une seule fois.
+    Fallback Vision sur les pages avec screenshot si équipe vide.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
-    # Récupérer les pages scrapées
+    # Récupérer toutes les pages scrapées (type, url, texte, screenshot)
     rows = cur.execute(
-        "SELECT page_type, dom_text, screenshot_path, used_vision FROM pages WHERE code=?",
+        "SELECT page_type, url, dom_text, screenshot_path FROM pages WHERE code=?",
         (code,)
     ).fetchall()
 
-    pages = {r[0]: r[1] for r in rows}
-    equipe_row = next((r for r in rows if r[0] == "equipe"), None)
-
     result = {}
 
-    # ── Extraction texte principale ──────────────────────────────────────────
-    result = _call_claude_text(client, nom, pages)
+    # ── Extraction texte — toutes les pages agrégées ─────────────────────────
+    result = _call_claude_text(client, nom, rows)
     result["raw_response"] = json.dumps(result, ensure_ascii=False)
 
-    # ── Fallback Vision si équipe vide ────────────────────────────────────────
-    if not result.get("equipe") and equipe_row and equipe_row[2]:
-        log.info(f"[{code}] Équipe vide → fallback Vision")
-        vision_result = _call_claude_vision(client, equipe_row[2])
-        if vision_result.get("equipe"):
-            result["equipe"] = vision_result["equipe"]
+    # ── Fallback Vision si équipe vide — on essaie TOUS les screenshots ──────
+    if not result.get("equipe"):
+        screenshot_rows = [r for r in rows if r[3]]  # pages avec screenshot
+        for ptype, purl, _, ss_path in screenshot_rows:
+            log.info(f"[{code}] Équipe vide → Vision sur {ptype} ({purl})")
+            vision_result = _call_claude_vision(client, ss_path)
+            if vision_result.get("equipe"):
+                result["equipe"] = vision_result["equipe"]
+                # Fusionner aussi les autres données Vision
+                for key in ["adherents", "projets", "contacts"]:
+                    if not result.get(key) and vision_result.get(key):
+                        result[key] = vision_result[key]
+                break
 
     # ── Email — Approche 2 : fallback Claude si regex n'a rien trouvé ────────
     email_row = cur.execute(
