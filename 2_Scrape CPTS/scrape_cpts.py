@@ -519,10 +519,25 @@ async def get_page_content(page, url: str) -> tuple[str, str | None]:
                     """)
                     if org_imgs:
                         try:
-                            r = httpx.get(org_imgs[0]['src'], timeout=15, follow_redirects=True)
+                            img_url = org_imgs[0]['src']
+                            # Wix sert souvent en AVIF malgré l'extension PNG
+                            # Forcer le PNG natif en remplaçant les paramètres de transco Wix
+                            if 'wixstatic.com' in img_url:
+                                import re as re2
+                                img_url = re2.sub(r'enc_avif[^/]*', 'enc_png', img_url)
+                                img_url = re2.sub(r'quality_auto[^/]*', '', img_url)
+                            r = httpx.get(img_url, timeout=15, follow_redirects=True)
                             if r.status_code == 200:
+                                # Vérifier le vrai Content-Type
+                                ct = r.headers.get('content-type', 'image/png')
+                                if 'avif' in ct:
+                                    # Re-essayer sans les paramètres Wix
+                                    base_url_img = img_url.split('/v1/')[0] + '/v1/fill/w_1200/' + img_url.split('/')[-1]
+                                    r2 = httpx.get(base_url_img, timeout=15, follow_redirects=True)
+                                    if r2.status_code == 200:
+                                        r = r2
                                 screenshot_b64 = base64.b64encode(r.content).decode()
-                                log.info(f"Image organigramme récupérée directement : {org_imgs[0]['alt']}")
+                                log.info(f"Image organigramme récupérée ({r.headers.get('content-type','?')}): {org_imgs[0]['alt']}")
                         except Exception as e_img:
                             log.debug(f"Erreur récupération image organigramme : {e_img}")
 
@@ -577,101 +592,49 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
             )].slice(0, 80);
         }}""")
 
-        # Texte + chiffres de la home
-        home_text, home_ss = await get_page_content(page, url)
+        # ── Home page : texte + email ─────────────────────────────────────
+        home_text, _ = await get_page_content(page, url)
         save_page(con, code, "home", url, home_text,
                   screenshot_path=None, used_vision=False)
 
-        # ── Email — Approche 1 : regex mailto sur le HTML brut ────────────────
         home_html = await page.content()
         raw_mailtos = re.findall(r'mailto:([^"\'\s>?&]+)', home_html, re.IGNORECASE)
         raw_mailtos = [m.strip().lower().split("?")[0] for m in raw_mailtos]
-        email_regex = pick_best_email(
-            extract_emails_regex(home_html, home_text), nom
-        )
-
-        # Chercher aussi sur la page contact si elle existe
-        contact_url = find_best_page(all_links, ["contact", "nous-contacter", "nous-ecrire"])
-        if contact_url and not email_regex:
-            try:
-                await page.goto(contact_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                await asyncio.sleep(1)
-                contact_html = await page.content()
-                contact_text = await page.evaluate("() => document.body.innerText")
-                email_regex = pick_best_email(
-                    extract_emails_regex(contact_html, contact_text), nom
-                )
-                raw_mailtos += re.findall(r'mailto:([^"\'\s>?&]+)', contact_html, re.IGNORECASE)
-                # Revenir à la home pour la suite
-                await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                await asyncio.sleep(1)
-            except Exception as e:
-                log.debug(f"[{code}] Page contact inaccessible: {e}")
-
-        # Stocker le résultat regex (Claude complétera en phase 2 si vide)
+        email_regex = pick_best_email(extract_emails_regex(home_html, home_text), nom)
         save_email(con, code, email_regex, None, list(set(raw_mailtos)))
-        log.info(f"[{code}] Email regex: {email_regex or '(non trouvé)'}")
+        log.info(f"[{code}] Email home: {email_regex or '(non trouvé)'}")
 
-        # ── 2. Page équipe ────────────────────────────────────────────────────
-        # Étape 1 : score URL
-        equipe_url = find_best_page(all_links, EQUIPE_KW)
+        # ── Option C : Discovery + scraping Content-First ────────────────────
+        log.info(f"[{code}] Discovery des pages candidates...")
+        scraped_pages = await discover_and_scrape_pages(page, url, all_links)
 
-        # Étape 2 : si aucune URL ne matche, on visite les pages courtes du menu
-        # et on cherche les mots-clés bureau dans leur texte
-        if not equipe_url:
-            # Pages candidates = liens courts (pas d'articles, pas de /20xx/)
-            candidates = [l for l in all_links
-                         if l != url
-                         and not any(x in l for x in ["pdf", "jpg", "png", "wp-content",
-                                                       "mentions", "confidential", "login",
-                                                       "inscription", "adherere", "don"])
-                         and len(l.replace(url, "").strip("/").split("/")) <= 2][:15]
-            for candidate in candidates:
+        vision_count = 0
+        for page_url, data in scraped_pages.items():
+            ss_path = None
+            if data["screenshot_b64"]:
+                vision_count += 1
+                ss_path = str(SCREENSHOTS_DIR / f"{code}_{vision_count}.png")
+                with open(ss_path, "wb") as f:
+                    f.write(base64.b64decode(data["screenshot_b64"]))
+            save_page(con, code, data["page_type"], page_url,
+                      data["text"], screenshot_path=ss_path,
+                      used_vision=bool(data["screenshot_b64"]))
+            # Email dans chaque page visitée
+            if not email_regex:
                 try:
-                    await page.goto(candidate, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                    await asyncio.sleep(1)
-                    cand_text = await page.evaluate("() => document.body.innerText")
-                    cand_lower = cand_text.lower()
-                    if sum(1 for kw in EQUIPE_TEXT_KW if kw in cand_lower) >= 2:
-                        equipe_url = candidate
-                        log.info(f"[{code}] Page équipe trouvée par texte : {candidate}")
-                        break
+                    await page.goto(page_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                    ph = await page.content()
+                    email_regex = pick_best_email(
+                        extract_emails_regex(ph, data["text"]), nom
+                    )
+                    raw_mailtos += re.findall(r'mailto:([^"\'\s>?&]+)', ph, re.IGNORECASE)
+                    if email_regex:
+                        save_email(con, code, email_regex, None, list(set(raw_mailtos)))
+                        log.info(f"[{code}] Email trouvé sur {page_url}: {email_regex}")
                 except Exception:
-                    continue
-            # Revenir à la home si on a navigué
-            if equipe_url:
-                await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                await asyncio.sleep(1)
+                    pass
 
-        equipe_url = equipe_url or url
-        log.info(f"[{code}] Page équipe retenue : {equipe_url}")
-        if equipe_url != url:
-            equipe_text, equipe_ss = await get_page_content(page, equipe_url)
-        else:
-            log.warning(f"[{code}] ⚠️ Fallback home — page équipe non trouvée")
-            equipe_text, equipe_ss = home_text, home_ss
-
-        # Sauvegarder screenshot si Vision nécessaire
-        ss_path = None
-        if equipe_ss:
-            ss_path = str(SCREENSHOTS_DIR / f"{code}_equipe.png")
-            with open(ss_path, "wb") as f:
-                f.write(base64.b64decode(equipe_ss))
-
-        save_page(con, code, "equipe", equipe_url, equipe_text,
-                  screenshot_path=ss_path, used_vision=bool(equipe_ss))
-
-        # ── 3. Page projets ───────────────────────────────────────────────────
-        projets_url = find_best_page(all_links, PROJET_KW)
-        if projets_url and projets_url != equipe_url:
-            projets_text, _ = await get_page_content(page, projets_url)
-            save_page(con, code, "projets", projets_url, projets_text)
-
-        # ── 4. Page actus (titres seulement, pas le détail) ───────────────────
-        actu_url = find_best_page(all_links, ACTU_KW)
-        if actu_url:
-            actu_text, _ = await get_page_content(page, actu_url)
-            save_page(con, code, "actus", actu_url, actu_text)
+        log.info(f"[{code}] {len(scraped_pages)} pages scrapées | {vision_count} screenshots")
 
         set_scrape_status(con, code, "done")
         log.info(f"[{code}] ✅ Scraping OK")
@@ -773,7 +736,7 @@ Réponds UNIQUEMENT avec ce JSON (sans markdown) :
   ]
 }}
 
-Si tu ne peux pas lire clairement un nom ou une fonction, omets ce membre.
+Extrais tous les membres que tu peux identifier, même partiellement. En cas de doute sur l'orthographe, inclus ta meilleure lecture. N'omets un membre que si son nom est totalement illisible.
 """
 
 
