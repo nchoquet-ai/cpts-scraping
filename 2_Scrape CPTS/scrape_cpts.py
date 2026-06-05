@@ -81,6 +81,7 @@ RETRY_429_MAX       = 5      # tentatives max
 
 # Seuil pour décider si le DOM est "pauvre" → fallback Vision
 MIN_TEXT_LENGTH     = 80     # caractères minimum pour considérer le texte suffisant
+MAX_PAGES_TO_SCRAPE = 20    # pages candidates visitées pour détection textuelle équipe
 
 # Mots-clés pages équipe (URLs)
 EQUIPE_KW = [
@@ -489,6 +490,14 @@ async def get_page_content(page, url: str) -> tuple[str, str | None]:
             remove.forEach(sel => {
                 try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch(e) {}
             });
+            // Dédupliquer les figcaptions (Elementor/Wix les duplique souvent)
+            const captions = document.querySelectorAll('figcaption, [class*=caption]');
+            const captionTexts = [...new Set(Array.from(captions).map(el => el.textContent.trim()).filter(t => t.length > 0))];
+            const seenCaptions = new Set();
+            Array.from(captions).forEach(el => {
+                const t = el.textContent.trim();
+                if (seenCaptions.has(t)) { el.remove(); } else { seenCaptions.add(t); }
+            });
             return document.body.innerText.replace(/\\s+/g, ' ').trim();
         }""")
 
@@ -576,11 +585,13 @@ async def discover_and_scrape_pages(
 
     # Fallback texte : visiter les candidats et détecter via EQUIPE_TEXT_KW
     if not equipe_url:
-        candidates = sorted(
-            all_links,
-            key=lambda l: score_url(l, EQUIPE_KW + PROJET_KW),
-            reverse=True,
-        )[:10]
+        def priority(link: str) -> int:
+            score = score_url(link, EQUIPE_KW + PROJET_KW)
+            if "cpts" in urlparse(link).path.lower():
+                score += 4
+            return score
+
+        candidates = sorted(all_links, key=priority, reverse=True)[:MAX_PAGES_TO_SCRAPE]
         for cand_url in candidates:
             try:
                 await page.goto(cand_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
@@ -1004,19 +1015,21 @@ def extract_one(client, code: str, nom: str) -> bool:
     result = _call_claude_text(client, nom, rows)
     result["raw_response"] = json.dumps(result, ensure_ascii=False)
 
-    # ── Fallback Vision si équipe vide — on essaie TOUS les screenshots ──────
-    if not result.get("equipe"):
-        screenshot_rows = [r for r in rows if r[3]]  # pages avec screenshot
-        for ptype, purl, _, ss_path in screenshot_rows:
-            log.info(f"[{code}] Équipe vide → Vision sur {ptype} ({purl})")
-            vision_result = _call_claude_vision(client, ss_path)
-            if vision_result.get("equipe"):
-                result["equipe"] = vision_result["equipe"]
-                # Fusionner aussi les autres données Vision
-                for key in ["adherents", "projets", "contacts"]:
-                    if not result.get(key) and vision_result.get(key):
-                        result[key] = vision_result[key]
-                break
+    # ── Vision systématique : fusionner TOUS les screenshots avec le texte ──────
+    screenshot_rows = [r for r in rows if r[3]]  # pages avec screenshot_path
+    for ptype, purl, _, ss_path in screenshot_rows:
+        log.info(f"[{code}] Vision sur {ptype} ({purl})")
+        vision_result = _call_claude_vision(client, ss_path)
+        if vision_result.get("equipe"):
+            existing_noms = {m.get("nom", "").lower() for m in result.get("equipe", [])}
+            for membre in vision_result["equipe"]:
+                if membre.get("nom", "").lower() not in existing_noms:
+                    result.setdefault("equipe", []).append(membre)
+                    existing_noms.add(membre.get("nom", "").lower())
+            log.info(f"[{code}] Après fusion vision+texte : {len(result.get('equipe', []))} membres")
+        for key in ["adherents", "contacts"]:
+            if not result.get(key) and vision_result.get(key):
+                result[key] = vision_result[key]
 
     # ── Email — Approche 2 : fallback Claude si regex n'a rien trouvé ────────
     email_row = cur.execute(
