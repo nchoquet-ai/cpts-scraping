@@ -491,14 +491,35 @@ async def get_page_content(page, url: str) -> tuple[str, str | None]:
             return document.body.innerText.replace(/\\s+/g, ' ').trim();
         }""")
 
-        # Si texte suffisant → pas besoin de Vision
-        if len(dom_text) >= MIN_TEXT_LENGTH:
-            return dom_text, None
+        screenshot_b64 = None
 
-        # Texte insuffisant → screenshot pour Vision
-        log.info(f"DOM pauvre ({len(dom_text)} chars) → screenshot Vision")
-        screenshot_bytes = await page.screenshot(full_page=True)
-        screenshot_b64   = base64.b64encode(screenshot_bytes).decode()
+        if len(dom_text) < MIN_TEXT_LENGTH:
+            # DOM pauvre (Wix/WP image-based) → scroll pour forcer rendu + screenshot Vision
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(1.5)
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            log.info(f"DOM pauvre ({len(dom_text)} chars) → screenshot Vision")
+            screenshot_bytes = await page.screenshot(full_page=True)
+            screenshot_b64   = base64.b64encode(screenshot_bytes).decode()
+        else:
+            # DOM suffisant → détecter organigramme image et forcer screenshot si trouvé
+            try:
+                page_html = await page.content()
+                if re.search(r'organigramme|org.?chart|trombinoscope', page_html, re.IGNORECASE):
+                    log.info("Organigramme détecté → screenshot Vision forcé")
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(1.5)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.5)
+                    screenshot_bytes = await page.screenshot(full_page=True)
+                    screenshot_b64   = base64.b64encode(screenshot_bytes).decode()
+            except Exception:
+                pass
+
         return dom_text, screenshot_b64
 
     except Exception as e:
