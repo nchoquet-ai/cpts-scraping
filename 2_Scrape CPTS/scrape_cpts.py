@@ -606,9 +606,13 @@ async def discover_and_scrape_pages(
                     await asyncio.sleep(0.5)
                 except Exception:
                     pass
-                cand_text = await page.evaluate(
-                    "() => document.body.innerText.replace(/\\s+/g, ' ').trim()"
-                )
+                cand_text = await page.evaluate("""() => {
+                    let text = document.body.innerText || '';
+                    const captions = document.querySelectorAll('figcaption, [class*=caption], [class*=wp-caption-text]');
+                    const captionTexts = [...new Set(Array.from(captions).map(el => el.textContent.trim()).filter(t => t.length > 0))];
+                    if (captionTexts.length > 0) text += ' ' + captionTexts.join(' ');
+                    return text.replace(/\\s+/g, ' ').trim();
+                }""")
                 text_lower = cand_text.lower()
                 if sum(1 for kw in EQUIPE_TEXT_KW if kw in text_lower) >= 2:
                     log.info(f"{prefix}Page équipe trouvée par texte : {cand_url}")
