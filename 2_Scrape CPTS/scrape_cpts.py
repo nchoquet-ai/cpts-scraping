@@ -595,7 +595,7 @@ async def discover_and_scrape_pages(
         for cand_url in candidates:
             try:
                 await page.goto(cand_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                await asyncio.sleep(1)
+                await asyncio.sleep(2.5)  # WordPress/JS rendering (1s insuffisant pour NA-73)
                 cand_text = await page.evaluate(
                     "() => document.body.innerText.replace(/\\s+/g, ' ').trim()"
                 )
