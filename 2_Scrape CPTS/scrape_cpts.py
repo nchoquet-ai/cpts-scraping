@@ -456,23 +456,25 @@ def save_email(con, code: str, email_regex: str | None,
 
 # ─── Phase 1 : Scraping Playwright ─────────────────────────────────────────────
 
-async def get_page_content(page, url: str) -> tuple[str, str | None]:
+async def get_page_content(page, url: str, skip_navigation: bool = False) -> tuple[str, str | None]:
     """
     Charge une URL, retourne (dom_text, screenshot_b64_or_None).
     Décide automatiquement si Vision est nécessaire.
+    Si skip_navigation=True, utilise le DOM déjà chargé (évite double goto).
     """
     try:
-        # domcontentloaded puis attente du rendu JS (Wix, WordPress...)
-        try:
-            await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-        except Exception:
-            # Retry sans timeout strict
+        if not skip_navigation:
+            # domcontentloaded puis attente du rendu JS (Wix, WordPress...)
             try:
-                await page.goto(url, timeout=30000, wait_until="commit")
-            except Exception as e2:
-                log.warning(f"Erreur get_page_content {url}: {e2}")
-                return "", None
-        await asyncio.sleep(NAV_PAUSE + 1)  # +1s pour Wix/WP
+                await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+            except Exception:
+                # Retry sans timeout strict
+                try:
+                    await page.goto(url, timeout=30000, wait_until="commit")
+                except Exception as e2:
+                    log.warning(f"Erreur get_page_content {url}: {e2}")
+                    return "", None
+            await asyncio.sleep(NAV_PAUSE + 1)  # +1s pour Wix/WP
 
         # Scroll pour déclencher le lazy-loading
         try:
@@ -685,7 +687,9 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
         }}""")
 
         # ── Home page : texte + email ─────────────────────────────────────
-        home_text, _ = await get_page_content(page, url)
+        # skip_navigation=True : on est déjà sur la home, évite double goto
+        # qui déclenche la bot-protection sur certains sites (ex. cpts3p.com)
+        home_text, _ = await get_page_content(page, url, skip_navigation=True)
         save_page(con, code, "home", url, home_text,
                   screenshot_path=None, used_vision=False)
 
