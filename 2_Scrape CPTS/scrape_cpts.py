@@ -677,18 +677,10 @@ EXTRACT_PROMPT = """\
 Tu es un expert en santé publique française. Analyse le contenu de ce site CPTS et extrais les informations structurées.
 
 CPTS : {nom}
+Pages analysées : {nb_pages}
 
-=== CONTENU PAGE ÉQUIPE ===
-{equipe_text}
-
-=== CONTENU PAGE PROJETS/MISSIONS ===
-{projets_text}
-
-=== CONTENU HOME (chiffres clés) ===
-{home_text}
-
-=== CONTENU ACTUS ===
-{actu_text}
+=== CONTENU DES PAGES DU SITE ===
+{pages_content}
 
 Réponds UNIQUEMENT avec ce JSON (sans markdown) :
 {{
