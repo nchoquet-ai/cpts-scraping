@@ -763,15 +763,17 @@ def _call_claude_text(client, nom, pages_rows: list) -> dict:
     home_rows = [r for r in pages_rows if r[0] == "home"]
     other_rows = [r for r in pages_rows if r[0] != "home"]
     
-    char_budget = 12000
-    
+    char_budget = 16000
+
     for ptype, purl, ptext, _ in (home_rows + other_rows):
         if not ptext or not ptext.strip():
             continue
-        # Budget par page : plus pour home et equipe
-        if ptype == "home":
+        # Budget par page : plus pour equipe (membres souvent en fin de page)
+        if ptype == "equipe":
+            limit = 6000
+        elif ptype == "home":
             limit = 3000
-        elif ptype in ("equipe", "other"):
+        elif ptype == "other":
             limit = 2500
         else:
             limit = 1500
