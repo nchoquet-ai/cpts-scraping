@@ -57,6 +57,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import anthropic
+import httpx
 import pandas as pd
 from tqdm import tqdm
 
@@ -70,7 +71,7 @@ SCREENSHOTS_DIR   = OUTPUT_DIR / "screenshots"
 
 # Playwright
 PAGE_TIMEOUT      = 20_000   # ms
-SCROLL_PAUSE      = 1.0      # secondes après scroll
+SCROLL_PAUSE      = 2.0      # secondes après scroll (lazy-loading WordPress)
 NAV_PAUSE         = 2.0      # secondes après navigation
 
 # Claude
@@ -477,7 +478,7 @@ async def get_page_content(page, url: str) -> tuple[str, str | None]:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(SCROLL_PAUSE)
             await page.evaluate("window.scrollTo(0, 0)")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2.0)  # attente supplémentaire pour animations JS
         except Exception:
             pass
 
@@ -510,13 +511,30 @@ async def get_page_content(page, url: str) -> tuple[str, str | None]:
             try:
                 page_html = await page.content()
                 if re.search(r'organigramme|org.?chart|trombinoscope', page_html, re.IGNORECASE):
-                    log.info("Organigramme détecté → screenshot Vision forcé")
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1.5)
-                    await page.evaluate("window.scrollTo(0, 0)")
-                    await asyncio.sleep(0.5)
-                    screenshot_bytes = await page.screenshot(full_page=True)
-                    screenshot_b64   = base64.b64encode(screenshot_bytes).decode()
+                    # Essayer d'abord de récupérer l'image organigramme directement
+                    org_imgs = await page.evaluate("""() =>
+                        Array.from(document.querySelectorAll('img'))
+                            .filter(i => i.alt && /organigramme|org.?chart|trombinoscope/i.test(i.alt))
+                            .map(i => ({src: i.src, alt: i.alt}))
+                    """)
+                    if org_imgs:
+                        try:
+                            r = httpx.get(org_imgs[0]['src'], timeout=15, follow_redirects=True)
+                            if r.status_code == 200:
+                                screenshot_b64 = base64.b64encode(r.content).decode()
+                                log.info(f"Image organigramme récupérée directement : {org_imgs[0]['alt']}")
+                        except Exception as e_img:
+                            log.debug(f"Erreur récupération image organigramme : {e_img}")
+
+                    if not screenshot_b64:
+                        # Fallback : screenshot pleine page
+                        log.info("Organigramme détecté → screenshot Vision forcé")
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(1.5)
+                        await page.evaluate("window.scrollTo(0, 0)")
+                        await asyncio.sleep(0.5)
+                        screenshot_bytes = await page.screenshot(full_page=True)
+                        screenshot_b64   = base64.b64encode(screenshot_bytes).decode()
             except Exception:
                 pass
 
