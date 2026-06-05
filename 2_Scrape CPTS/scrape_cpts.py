@@ -560,6 +560,79 @@ async def get_page_content(page, url: str) -> tuple[str, str | None]:
         return "", None
 
 
+async def discover_and_scrape_pages(
+    page, home_url: str, all_links: list, code: str = ""
+) -> dict:
+    """
+    Découvre et scrape les pages candidates (équipe, projets, actus).
+    Retourne : {url: {"text": str, "screenshot_b64": str|None, "page_type": str}}
+    La home n'est PAS incluse (déjà sauvegardée par scrape_one).
+    """
+    result = {}
+    prefix = f"[{code}] " if code else ""
+
+    # ── 1. Page équipe ─────────────────────────────────────────────────────────
+    equipe_url = find_best_page(all_links, EQUIPE_KW)
+
+    # Fallback texte : visiter les candidats et détecter via EQUIPE_TEXT_KW
+    if not equipe_url:
+        candidates = sorted(
+            all_links,
+            key=lambda l: score_url(l, EQUIPE_KW + PROJET_KW),
+            reverse=True,
+        )[:10]
+        for cand_url in candidates:
+            try:
+                await page.goto(cand_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                await asyncio.sleep(1)
+                cand_text = await page.evaluate(
+                    "() => document.body.innerText.replace(/\\s+/g, ' ').trim()"
+                )
+                text_lower = cand_text.lower()
+                if sum(1 for kw in EQUIPE_TEXT_KW if kw in text_lower) >= 2:
+                    log.info(f"{prefix}Page équipe trouvée par texte : {cand_url}")
+                    equipe_url = cand_url
+                    break
+            except Exception:
+                pass
+
+    if equipe_url:
+        log.info(f"{prefix}Page équipe retenue : {equipe_url}")
+    else:
+        equipe_url = home_url
+        log.warning(f"{prefix}⚠️ Fallback home — page équipe non trouvée")
+        log.info(f"{prefix}Page équipe retenue : {equipe_url}")
+
+    equipe_text, equipe_ss = await get_page_content(page, equipe_url)
+    result[equipe_url] = {
+        "text": equipe_text,
+        "screenshot_b64": equipe_ss,
+        "page_type": "equipe",
+    }
+
+    # ── 2. Page projets ────────────────────────────────────────────────────────
+    projets_url = find_best_page(all_links, PROJET_KW)
+    if projets_url and projets_url not in result:
+        projets_text, _ = await get_page_content(page, projets_url)
+        result[projets_url] = {
+            "text": projets_text,
+            "screenshot_b64": None,
+            "page_type": "projets",
+        }
+
+    # ── 3. Page actus ──────────────────────────────────────────────────────────
+    actu_url = find_best_page(all_links, ACTU_KW)
+    if actu_url and actu_url not in result:
+        actu_text, _ = await get_page_content(page, actu_url)
+        result[actu_url] = {
+            "text": actu_text,
+            "screenshot_b64": None,
+            "page_type": "actus",
+        }
+
+    return result
+
+
 async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
     """Scrape un site CPTS complet."""
     context = await browser.new_context(
@@ -606,7 +679,7 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
 
         # ── Option C : Discovery + scraping Content-First ────────────────────
         log.info(f"[{code}] Discovery des pages candidates...")
-        scraped_pages = await discover_and_scrape_pages(page, url, all_links)
+        scraped_pages = await discover_and_scrape_pages(page, url, all_links, code)
 
         vision_count = 0
         for page_url, data in scraped_pages.items():
