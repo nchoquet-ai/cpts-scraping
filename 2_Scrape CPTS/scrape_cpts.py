@@ -596,6 +596,14 @@ async def discover_and_scrape_pages(
             try:
                 await page.goto(cand_url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 await asyncio.sleep(2.5)  # WordPress/JS rendering (1s insuffisant pour NA-73)
+                # Scroll pour déclencher le lazy-loading et révéler le contenu hors viewport
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(1.5)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
                 cand_text = await page.evaluate(
                     "() => document.body.innerText.replace(/\\s+/g, ' ').trim()"
                 )
