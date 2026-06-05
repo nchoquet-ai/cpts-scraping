@@ -995,6 +995,9 @@ def extract_one(client, code: str, nom: str) -> bool:
         (code,)
     ).fetchall()
 
+    # Dict page_type → dom_text (pour recherche email fallback)
+    pages = {ptype: (ptext or "") for ptype, _, ptext, _ in rows}
+
     result = {}
 
     # ── Extraction texte — toutes les pages agrégées ─────────────────────────
