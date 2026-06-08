@@ -770,6 +770,13 @@ async def run_scraping(con, limit=None, resume=False):
         for code, nom, url in tqdm(todo, desc="Scraping"):
             await scrape_one(browser, code, nom, url, con)
             await asyncio.sleep(1)  # politesse
+
+            # Checkpoint tous les 25 sites
+            done = todo.index((code, nom, url)) + 1  # position approximative
+            if done % 25 == 0:
+                ok  = con.execute("SELECT COUNT(*) FROM cpts WHERE scrape_status='done'").fetchone()[0]
+                err = con.execute("SELECT COUNT(*) FROM cpts WHERE scrape_status='error'").fetchone()[0]
+                log.info(f"Checkpoint {done}/{len(todo)} — ✅ {ok} scrapées | ❌ {err} erreurs")
         await browser.close()
 
     log.info("Phase 1 terminée.")
