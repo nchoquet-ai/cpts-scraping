@@ -500,7 +500,8 @@ async def get_page_content(page, url: str, skip_navigation: bool = False) -> tup
                 const t = el.textContent.trim();
                 if (seenCaptions.has(t)) { el.remove(); } else { seenCaptions.add(t); }
             });
-            return document.body.innerText.replace(/\\s+/g, ' ').trim();
+            const baseText = document.body.innerText || '';
+            return (baseText + ' ' + captionTexts.join(' ')).replace(/\\s+/g, ' ').trim();
         }""")
 
         screenshot_b64 = None
