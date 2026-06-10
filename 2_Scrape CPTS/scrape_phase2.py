@@ -62,6 +62,8 @@ RETRY_429_MAX       = 5
 
 CHUNK_CHARS    = 150_000   # taille max d'un appel holistique (≈ 37k tokens)
 MIN_TEXT_LEN   = 80        # DOM "pauvre" → candidat Vision
+MIN_CONTENT    = 200       # pages "coquilles" (< N chars) exclues de l'appel TEXTE Claude
+                           # (réduit les tokens ; elles restent candidates Vision)
 VISION_MAX     = 4         # nb max de screenshots envoyés à Vision par CPTS
 FUZZY_THRESHOLD = 0.62     # seuil de rapprochement CIM-10 (étape b)
 
@@ -537,30 +539,38 @@ def extract_one(client, code, nom) -> bool:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     pages = cur.execute(
-        "SELECT url, dom_text, screenshot_path FROM pages WHERE code=?", (code,)
+        "SELECT url, dom_text, screenshot_path, page_type FROM pages WHERE code=?", (code,)
     ).fetchall()
     if not pages:
         log.warning(f"[{code}] aucune page — skip")
         set_extract_status(con, code, "done"); con.close(); return False
 
     # ── 1. Extraction holistique texte (chunké) ──────────────────────────────
-    text_rows = [(u, t) for u, t, _ in pages]
+    # Filtre les pages "coquilles" (< MIN_CONTENT chars) pour économiser les tokens.
+    text_rows = [(u, t) for u, t, _, _ in pages if len((t or "").strip()) >= MIN_CONTENT]
+    if not text_rows:  # site entièrement image → garder ce qu'on a
+        text_rows = [(u, t) for u, t, _, _ in pages]
+    n_skip = len(pages) - len(text_rows)
+    if n_skip:
+        log.info(f"[{code}] {n_skip} pages coquilles exclues du texte (< {MIN_CONTENT} chars)")
     chunks = _build_chunks(text_rows)
     results = [_call_claude_text(client, nom, ch) for ch in chunks]
     result = _merge_text_results(results)
 
     # ── 2. Vision ciblée équipe + DOM pauvre (sélection par contenu) ──────────
+    #     Priorité : organigramme natif (-1) > URL équipe (0) > mots-clés (1) > DOM pauvre (2)
     vision_candidates = []
-    for url, txt, ss in pages:
+    for url, txt, ss, ptype in pages:
         if not ss:
             continue
         tl = (txt or "").lower()
         path = urlparse(url).path.lower()
+        is_org    = (ptype == "organigramme")                    # image organigramme native
         is_url    = any(k in path for k in EQUIPE_URL_KW)        # URL "équipe" (organigramme)
         is_equipe = any(kw in tl for kw in EQUIPE_VISION_KW)     # mots-clés équipe dans le texte
         is_poor   = len(tl.strip()) < MIN_TEXT_LEN               # page image (DOM pauvre)
-        if is_url or is_equipe or is_poor:
-            prio = 0 if is_url else (1 if is_equipe else 2)
+        if is_org or is_url or is_equipe or is_poor:
+            prio = -1 if is_org else (0 if is_url else (1 if is_equipe else 2))
             vision_candidates.append((prio, ss, url))
     vision_candidates.sort(key=lambda x: x[0])
     for _, ss, url in vision_candidates[:VISION_MAX]:
@@ -573,7 +583,7 @@ def extract_one(client, code, nom) -> bool:
                 result["equipe"].append(m); existing.add(key)
 
     # ── 3. Email : regex sur toutes les pages → fallback Claude ───────────────
-    home_html_text = " ".join((t or "") for _, t, _ in pages)
+    home_html_text = " ".join((t or "") for _, t, _, _ in pages)
     emails = extract_emails_regex("", home_html_text)
     email_regex = pick_best_email(emails)
     email_claude = None

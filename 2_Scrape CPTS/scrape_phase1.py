@@ -36,8 +36,10 @@ import argparse
 import asyncio
 import base64
 import logging
+import re
 import sqlite3
 import sys
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -45,6 +47,7 @@ from urllib.parse import urlparse
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import httpx
 import pandas as pd
 from tqdm import tqdm
 
@@ -61,6 +64,13 @@ NAV_PAUSE    = 2.0      # secondes après navigation
 
 # Parallélisation : nombre de CPTS scrapées simultanément (chacune = 1 contexte Chromium)
 CONCURRENCY  = 8        # surchargé par --concurrency
+
+# Découverte des pages : sitemap.xml + liens home + profondeur 2 (BFS), plafonné par CPTS
+MAX_PAGES = 200         # plafond de pages visitées par CPTS (surchargé par --max-pages)
+MAX_DEPTH = 2           # profondeur de crawl (0=home, 1=liens home/sitemap, 2=sous-liens)
+ORG_RE    = re.compile(r"organigramme|trombinoscope|org.?chart", re.IGNORECASE)
+SKIP_EXT  = re.compile(r"\.(pdf|jpg|jpeg|png|gif|svg|webp|css|js|zip|docx?|xlsx?|pptx?)$", re.IGNORECASE)
+HTTP_UA   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"}
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 
@@ -155,12 +165,91 @@ def normalize_url(raw: str) -> str:
         return "https://" + s
     return ""
 
+
+def fetch_sitemap_urls(base_url: str, limit: int = 1000) -> list[str]:
+    """
+    Récupère la liste des pages depuis le sitemap.xml (et sous-sitemaps d'index).
+    Retourne les URLs internes (même domaine, hors fichiers). Best-effort, jamais bloquant.
+    """
+    base_domain = urlparse(base_url).netloc
+    root = f"{urlparse(base_url).scheme}://{base_domain}"
+    found: list[str] = []
+    seen_sm: set[str] = set()
+
+    def _get(u):
+        try:
+            r = httpx.get(u, headers=HTTP_UA, timeout=15, follow_redirects=True)
+            return r.text if r.status_code == 200 else ""
+        except Exception:
+            return ""
+
+    candidates = deque([root + p for p in ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml")])
+    while candidates and len(found) < limit:
+        sm = candidates.popleft()
+        if sm in seen_sm:
+            continue
+        seen_sm.add(sm)
+        xml = _get(sm)
+        if not xml:
+            continue
+        locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml, re.IGNORECASE)
+        for loc in locs:
+            if loc.lower().endswith(".xml"):           # sous-sitemap d'index
+                if loc not in seen_sm and base_domain in loc:
+                    candidates.append(loc)
+            elif base_domain in loc and not SKIP_EXT.search(loc) and "#" not in loc:
+                found.append(loc)
+    # dédup en préservant l'ordre
+    seen, out = set(), []
+    for u in found:
+        k = u.rstrip("/")
+        if k not in seen:
+            seen.add(k); out.append(u)
+    return out
+
 # ─── Phase 1 : Scraping Playwright ─────────────────────────────────────────────
 
-async def get_page_content(page, url: str, skip_navigation: bool = False) -> tuple[str, str | None]:
+async def _fetch_org_image(page) -> str | None:
     """
-    Charge une URL et retourne (dom_text, screenshot_b64).
-    Screenshot SYSTÉMATIQUE — aucune analyse, aucune condition.
+    Si la page contient un organigramme/trombinoscope (image), télécharge l'image
+    NATIVE (haute résolution) via httpx et retourne son base64. Sinon None.
+    Gère les images Wix servies en AVIF malgré l'extension PNG.
+    """
+    try:
+        page_html = await page.content()
+        if not ORG_RE.search(page_html):
+            return None
+        org_imgs = await page.evaluate("""() =>
+            Array.from(document.querySelectorAll('img'))
+                .filter(i => (i.alt && /organigramme|trombinoscope|org.?chart/i.test(i.alt))
+                          || (i.src && /organigramme|trombinoscope|org.?chart/i.test(i.src)))
+                .map(i => i.src)
+        """)
+        if not org_imgs:
+            return None
+        img_url = org_imgs[0]
+        if "wixstatic.com" in img_url:
+            img_url = re.sub(r"enc_avif[^/]*", "enc_png", img_url)
+            img_url = re.sub(r"quality_auto[^/]*", "", img_url)
+        r = httpx.get(img_url, headers=HTTP_UA, timeout=15, follow_redirects=True)
+        if r.status_code != 200:
+            return None
+        if "avif" in r.headers.get("content-type", ""):
+            base = img_url.split("/v1/")[0] + "/v1/fill/w_1200/" + img_url.split("/")[-1]
+            r2 = httpx.get(base, headers=HTTP_UA, timeout=15, follow_redirects=True)
+            if r2.status_code == 200:
+                r = r2
+        log.info(f"Image organigramme native récupérée ({r.headers.get('content-type','?')})")
+        return base64.b64encode(r.content).decode()
+    except Exception as e:
+        log.debug(f"Erreur récupération organigramme : {e}")
+        return None
+
+
+async def get_page_content(page, url: str, skip_navigation: bool = False) -> tuple[str, str | None, str | None]:
+    """
+    Charge une URL et retourne (dom_text, screenshot_b64, org_image_b64_or_None).
+    Screenshot SYSTÉMATIQUE. org_image = image organigramme native si détectée.
     Si skip_navigation=True, utilise le DOM déjà chargé (évite double goto).
     """
     try:
@@ -172,7 +261,7 @@ async def get_page_content(page, url: str, skip_navigation: bool = False) -> tup
                     await page.goto(url, timeout=30000, wait_until="commit")
                 except Exception as e:
                     log.warning(f"Erreur goto {url}: {e}")
-                    return "", None
+                    return "", None, None
             await asyncio.sleep(NAV_PAUSE + 1)  # +1s pour Wix/WP
 
         # Scroll pour déclencher le lazy-loading
@@ -193,15 +282,18 @@ async def get_page_content(page, url: str, skip_navigation: bool = False) -> tup
             return document.body.innerText.replace(/\\s+/g, ' ').trim();
         }""")
 
+        # Image organigramme native (avant suppression DOM ? on relit le HTML complet)
+        org_b64 = await _fetch_org_image(page)
+
         # Screenshot systématique full-page
         screenshot_bytes = await page.screenshot(full_page=True)
         screenshot_b64   = base64.b64encode(screenshot_bytes).decode()
 
-        return dom_text, screenshot_b64
+        return dom_text, screenshot_b64, org_b64
 
     except Exception as e:
         log.warning(f"Erreur get_page_content {url}: {e}")
-        return "", None
+        return "", None, None
 
 
 async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
@@ -213,6 +305,24 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
     )
     page = await context.new_page()
 
+    base_domain = urlparse(url).netloc
+
+    def internal(h: str) -> bool:
+        return (base_domain in h) and ("#" not in h) and not SKIP_EXT.search(h)
+
+    async def harvest_links(p) -> list[str]:
+        try:
+            return await p.evaluate(f"""() => {{
+                const domain = '{base_domain}';
+                return [...new Set(
+                    Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter(h => h.includes(domain) && !h.includes('#'))
+                )];
+            }}""")
+        except Exception:
+            return []
+
     try:
         log.info(f"[{code}] Scraping {url}")
         await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
@@ -222,38 +332,59 @@ async def scrape_one(browser, code: str, nom: str, url: str, con) -> bool:
         except Exception:
             pass
 
-        # Tous les liens internes depth=1 (sans limite, sans tri, sans filtre)
-        base_domain = urlparse(url).netloc
-        all_links = await page.evaluate(f"""() => {{
-            const domain = '{base_domain}';
-            return [...new Set(
-                Array.from(document.querySelectorAll('a[href]'))
-                    .map(a => a.href)
-                    .filter(h => h.includes(domain) && !h.includes('#')
-                                 && !h.match(/\\.(pdf|jpg|png|css|js)$/i))
-            )];
-        }}""")
+        # ── Seeds : home + liens home (depth 1) ∪ sitemap (depth 1) ───────────
+        home_links = await harvest_links(page)
+        sitemap_links = fetch_sitemap_urls(url)
+        log.info(f"[{code}] {len(home_links)} liens home | {len(sitemap_links)} pages sitemap")
 
-        # Home en premier, puis tous les autres liens (dédoublonnés vs home)
-        pages_to_visit = [url] + [l for l in all_links if l.rstrip('/') != url.rstrip('/')]
+        seen: set[str] = set()
+        queue: deque = deque()
 
-        for i, page_url in enumerate(pages_to_visit):
-            skip = (i == 0)  # home déjà chargée → évite double goto (bot-protection)
-            dom_text, ss_b64 = await get_page_content(page, page_url, skip_navigation=skip)
+        def enqueue(u: str, depth: int):
+            k = u.rstrip("/")
+            if k and k not in seen and internal(u):
+                seen.add(k); queue.append((u, depth))
+
+        enqueue(url, 0)
+        for l in home_links:    enqueue(l, 1)
+        for l in sitemap_links: enqueue(l, 1)
+
+        # ── BFS jusqu'à MAX_DEPTH, plafonné à MAX_PAGES ───────────────────────
+        visited = 0
+        idx = 0
+        while queue and visited < MAX_PAGES:
+            page_url, depth = queue.popleft()
+            skip = (page_url.rstrip("/") == url.rstrip("/") and visited == 0)
+            dom_text, ss_b64, org_b64 = await get_page_content(page, page_url, skip_navigation=skip)
+
+            ss_dir = SCREENSHOTS_DIR / code
+            ss_dir.mkdir(parents=True, exist_ok=True)
 
             ss_path = None
             if ss_b64:
-                ss_dir = SCREENSHOTS_DIR / code
-                ss_dir.mkdir(parents=True, exist_ok=True)
-                ss_path = str(ss_dir / f"{code}_{i}.png")
+                ss_path = str(ss_dir / f"{code}_{idx}.png")
                 with open(ss_path, "wb") as f:
                     f.write(base64.b64decode(ss_b64))
-
-            # page_type = "" pour toutes les pages (aucun tag)
             save_page(con, code, "", page_url, dom_text,
                       screenshot_path=ss_path, used_vision=bool(ss_b64))
 
-        log.info(f"[{code}] {len(pages_to_visit)} pages scrapées")
+            # Image organigramme native → ligne dédiée page_type='organigramme'
+            if org_b64:
+                org_path = str(ss_dir / f"{code}_{idx}_org.png")
+                with open(org_path, "wb") as f:
+                    f.write(base64.b64decode(org_b64))
+                save_page(con, code, "organigramme", page_url, "",
+                          screenshot_path=org_path, used_vision=True)
+
+            visited += 1
+            idx += 1
+
+            # Profondeur : récupérer les sous-liens (depth+1) tant que < MAX_DEPTH
+            if depth < MAX_DEPTH:
+                for l in await harvest_links(page):
+                    enqueue(l, depth + 1)
+
+        log.info(f"[{code}] {visited} pages scrapées (plafond {MAX_PAGES})")
         set_scrape_status(con, code, "done")
         log.info(f"[{code}] ✅ Scraping OK")
         return True
@@ -385,8 +516,12 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Reprendre sans reset des erreurs")
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY,
                         help=f"CPTS scrapées en parallèle (défaut: {CONCURRENCY})")
+    parser.add_argument("--max-pages", type=int, default=MAX_PAGES, dest="max_pages",
+                        help=f"Plafond de pages par CPTS (défaut: {MAX_PAGES})")
     parser.add_argument("--stats",  action="store_true", help="Afficher les stats de la DB")
     args = parser.parse_args()
+
+    MAX_PAGES = args.max_pages
 
     if not any([args.input, args.stats]):
         parser.print_help()
