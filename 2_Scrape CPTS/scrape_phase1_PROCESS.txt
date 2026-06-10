@@ -1,0 +1,292 @@
+================================================================================
+  COLLECTE BRUTE DES PAGES CPTS — PHASE 1
+  Documentation du processus — scrape_phase1.py
+  Dernière mise à jour : juin 2026
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  VUE D'ENSEMBLE
+────────────────────────────────────────────────────────────────────────────────
+
+scrape_phase1.py visite chaque site CPTS et capture le contenu BRUT de toutes
+ses pages (texte + capture d'écran), sans aucune analyse. C'est une simple
+collecte exhaustive : on ramène tout, on triera plus tard.
+
+Principe « capture brute, on filtre en Phase 2 » :
+  - Le script charge la page d'accueil
+  - Il récupère TOUS les liens internes visibles sur la home (profondeur 1)
+  - Il visite chaque lien, sans limite de nombre, sans tri, sans filtre
+  - Pour chaque page : texte du DOM + capture d'écran pleine page (systématique)
+  - Tout est stocké tel quel dans une base SQLite locale (Output/cpts.db)
+
+Ce qui N'EST PAS fait en Phase 1 (réservé à la Phase 2) :
+  - Aucun appel à Claude (ni texte, ni Vision)
+  - Aucun scoring d'URL, aucun mot-clé, aucun tag de page
+  - Aucune extraction d'équipe / projets / actus / email
+  - Aucune détection d'organigramme
+
+Pourquoi séparer ainsi :
+  - Le scraping (lent, dépend du réseau) est fait UNE seule fois
+  - L'analyse (Phase 2) peut être relancée à volonté, avec un meilleur prompt
+    ou un modèle plus récent, SANS jamais re-scraper
+  - La table « pages » est une source de vérité immuable
+
+Ce script est à lancer APRÈS avoir vérifié et complété les URLs
+(fichier « Liste des CPTS avec site validé »).
+
+
+────────────────────────────────────────────────────────────────────────────────
+  AVANT DE LANCER LE SCRIPT
+────────────────────────────────────────────────────────────────────────────────
+
+Prérequis :
+  1. Python 3.10 ou supérieur
+  2. Les bibliothèques installées :
+       pip install playwright pandas openpyxl tqdm
+       (PAS besoin de anthropic ni httpx — aucune analyse en Phase 1)
+  3. Le navigateur Chromium installé (une seule fois) :
+       python -m playwright install chromium
+
+  → AUCUNE clé API n'est nécessaire en Phase 1.
+
+Format du fichier Excel source :
+  Colonnes acceptées (noms flexibles, détection automatique) :
+  - Code  : "Code CPTS", "Code_CPTS"...
+  - Nom   : "Nom CPTS", "Label_CPTS_OPEX", "Nom de la CPTS"...
+  - URL   : "URL finale", "site", "Site internet", "url"...
+
+
+────────────────────────────────────────────────────────────────────────────────
+  ARCHITECTURE DE LA BASE SQLITE (Output/cpts.db)
+────────────────────────────────────────────────────────────────────────────────
+
+Pas de serveur, pas d'installation — juste un fichier SQLite sur votre disque.
+Pour explorer visuellement : télécharger "DB Browser for SQLite" (gratuit,
+https://sqlitebrowser.org). Ouvrir en lecture seule si un scraping tourne.
+
+La Phase 1 ne crée que DEUX tables :
+
+  Table "cpts"
+    code, nom, url
+    scrape_status   : 'pending' | 'done' | 'error' | 'skip'
+    scrape_ts       : horodatage du dernier scraping
+
+  Table "pages"  (une ligne = une page visitée)
+    code            : code CPTS
+    page_type       : TOUJOURS vide ("") — aucun tag en Phase 1
+    url             : URL exacte de la page
+    dom_text        : texte brut du DOM (script/style/nav/footer retirés)
+    screenshot_path : chemin vers le PNG (toujours présent)
+    used_vision     : toujours 1 (capture systématique)
+    ts              : horodatage
+
+  → Les tables "extractions" et "emails" seront créées par la Phase 2.
+
+  Dossier Output/screenshots/
+    Un sous-dossier par CPTS : Output/screenshots/{code}/
+    Captures pleine page nommées {code}_{n}.png
+    (ex : Output/screenshots/PDL-24/PDL-24_0.png pour la home,
+          PDL-24_1.png, PDL-24_2.png ... pour les pages suivantes)
+    Le numéro {n} correspond à l'ordre de visite (0 = home).
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FONCTIONNEMENT DÉTAILLÉ DU SCRAPING
+────────────────────────────────────────────────────────────────────────────────
+
+Pour chaque CPTS :
+
+  1. Chargement de la home page (Playwright / Chromium headless)
+
+  2. Extraction de TOUS les liens internes depuis la home :
+       - même domaine que la home
+       - sans ancres (#), sans fichiers (.pdf .jpg .png .css .js)
+       - dédupliqués, dans l'ordre du DOM
+       - AUCUNE limite de nombre, AUCUN tri par pertinence
+
+  3. Visite de chaque page (home incluse, en premier) :
+       - navigation puis attente du rendu JS (Wix / WordPress)
+       - double scroll (bas puis haut) pour déclencher le lazy-loading
+       - extraction du texte du DOM (innerText nettoyé)
+       - capture d'écran pleine page (full_page) SYSTÉMATIQUE
+       - sauvegarde immédiate en base (page_type vide)
+
+  4. La home n'est PAS rechargée une 2e fois (skip_navigation) :
+       évite la double navigation qui déclenche la bot-protection
+       sur certains sites.
+
+Parallélisation :
+  - Plusieurs CPTS sont scrapées SIMULTANÉMENT (option --concurrency, défaut 8)
+  - Chaque CPTS tourne dans son propre contexte Chromium isolé
+  - Comme chaque CPTS est un domaine différent, aucun risque de surcharger
+    un serveur unique (la politesse par domaine est respectée d'office)
+  - Checkpoint de progression tous les 25 CPTS terminés dans les logs
+
+Journal : toutes les opérations sont tracées dans Output/scrape_phase1.log
+
+
+────────────────────────────────────────────────────────────────────────────────
+  COMMANDES
+────────────────────────────────────────────────────────────────────────────────
+
+  # Scraping complet (concurrence par défaut = 8)
+  python scrape_phase1.py --input "Input\Liste des CPTS avec site validé.xlsx"
+
+  # Pousser la parallélisation (ex : 10 CPTS en simultané)
+  python scrape_phase1.py --input "Input\Liste des CPTS avec site validé.xlsx" --concurrency 10
+
+  # Test sur N CPTS
+  python scrape_phase1.py --input "Input\Liste des CPTS avec site validé.xlsx" --limit 5
+
+  # Reprendre après interruption (ne réinitialise PAS les erreurs)
+  python scrape_phase1.py --input "Input\Liste des CPTS avec site validé.xlsx" --resume
+
+  # État de la base
+  python scrape_phase1.py --stats
+
+Options disponibles :
+  --input        Fichier Excel source (obligatoire pour scraper)
+  --limit N      Limiter aux N premières CPTS (test)
+  --resume       Reprendre sans remettre les "error" en "pending"
+  --concurrency  Nombre de CPTS scrapées en parallèle (défaut : 8)
+  --stats        Afficher l'état de la base puis quitter
+
+Comportement par défaut (sans --resume) :
+  Les CPTS en statut "error" sont remises en "pending" pour être réessayées.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  DURÉE, VOLUME ET DIMENSIONNEMENT
+────────────────────────────────────────────────────────────────────────────────
+
+Mesuré sur le lot pilote (12 CPTS « sites validés ») :
+  - 11 CPTS scrapées avec succès, 1 erreur (domaine DNS mort)
+  - 376 pages capturées au total (~19 pages/CPTS en moyenne)
+  - 100 % des pages ont à la fois un texte DOM et une capture d'écran
+  - Durée : ~13 min à concurrence 8
+
+Important — le nombre de pages varie ÉNORMÉMENT selon le site :
+  - Sites « vitrine » simples         : 9 à 18 pages
+  - Sites riches en actus/projets     : 35 à 55 pages
+  - Plateformes type site-sante.fr    : jusqu'à ~96 pages
+    (une URL par article d'actualité, toutes liées depuis la home)
+  C'est volontaire : on capture tout, on filtrera en Phase 2.
+
+Extrapolation pour 852 CPTS (à concurrence 8) :
+  - Durée estimée   : ~5 heures
+  - Volume disque   : ~13 Go de captures d'écran PNG
+  - Pages totales   : ~16 000 pages
+  - Coût API        : 0 € (aucun appel Claude en Phase 1)
+
+Prévoir l'espace disque en conséquence (les screenshots sont volumineux).
+
+
+────────────────────────────────────────────────────────────────────────────────
+  CAS PARTICULIERS ET LIMITES CONNUES
+────────────────────────────────────────────────────────────────────────────────
+
+  Sites avec beaucoup d'articles (plateformes type site-sante.fr)
+    → Une URL par article → 50 à 100 pages pour une seule CPTS
+    → Le scraping de ces sites domine la durée totale
+    → Comportement attendu : capture exhaustive
+
+  Sites Wix / WordPress (rendu JavaScript)
+    → Le contenu se charge en différé → temporisations + double scroll
+    → Même si le texte du DOM reste pauvre, la capture d'écran est prise
+      systématiquement : la Phase 2 (Vision) pourra la lire
+
+  Pages « pauvres » en texte (< 50 caractères)
+    → Conservées telles quelles : elles ont leur capture d'écran
+    → NE PAS les supprimer (l'analyse Vision s'en chargera en Phase 2)
+
+  Domaines inaccessibles ou disparus
+    → Erreur réseau (ex : ERR_NAME_NOT_RESOLVED = DNS qui ne résout plus)
+    → La CPTS est marquée "error" dans la base, sans page
+    → Relançable avec --resume si l'URL est corrigée dans le fichier source
+
+  Bot-protection
+    → La home n'est jamais rechargée deux fois (skip_navigation)
+      pour éviter de déclencher les protections anti-robot
+
+
+────────────────────────────────────────────────────────────────────────────────
+  EN CAS DE PROBLÈME
+────────────────────────────────────────────────────────────────────────────────
+
+  "playwright not found" ou "chromium not found"
+    → python -m playwright install chromium
+
+  Le scraping est très long
+    → Augmenter la parallélisation : --concurrency 10
+    → Vérifier qu'aucune CPTS « lourde » (>100 pages) ne bloque un worker
+
+  Une CPTS est en "error"
+    → Ouvrir son URL dans un navigateur pour vérifier qu'elle existe encore
+    → Si l'URL est obsolète : la corriger dans le fichier source
+    → Relancer : python scrape_phase1.py --input "..." --resume
+
+  Reprendre un scraping interrompu
+    → python scrape_phase1.py --input "..." --resume
+    → Les CPTS déjà en "done" ne sont pas re-scrapées
+
+  Vider la base et repartir de zéro
+    → Sauvegarder d'abord Output/cpts.db par sécurité, puis :
+       python -c "
+       import os, shutil, glob
+       if os.path.exists('Output/cpts.db'): os.remove('Output/cpts.db')
+       for d in glob.glob('Output/screenshots/*'):
+           if os.path.isdir(d): shutil.rmtree(d, ignore_errors=True)
+       print('Base et captures supprimées')
+       "
+    → Le fichier cpts.db et les tables sont recréés au prochain lancement.
+
+  Re-scraper UNE CPTS précise (ex : PDL-24)
+    → python -c "
+       import sqlite3, shutil
+       con = sqlite3.connect('Output/cpts.db')
+       con.execute(\"UPDATE cpts SET scrape_status='pending' WHERE code='PDL-24'\")
+       con.execute(\"DELETE FROM pages WHERE code='PDL-24'\")
+       con.commit()
+       shutil.rmtree('Output/screenshots/PDL-24', ignore_errors=True)
+       print('PDL-24 remise en pending')
+       "
+    → python scrape_phase1.py --input "..." --resume
+
+
+────────────────────────────────────────────────────────────────────────────────
+  REQUÊTES SQL UTILES
+────────────────────────────────────────────────────────────────────────────────
+
+  # Nombre de pages scrapées par CPTS
+  SELECT code, COUNT(*) AS nb_pages
+  FROM pages GROUP BY code ORDER BY nb_pages DESC;
+
+  # Statut de scraping global
+  SELECT scrape_status, COUNT(*) FROM cpts GROUP BY scrape_status;
+
+  # CPTS en erreur (à vérifier / corriger)
+  SELECT code, nom, url FROM cpts WHERE scrape_status='error';
+
+  # Pages au texte pauvre (Vision nécessaire en Phase 2)
+  SELECT code, url, length(dom_text) AS n
+  FROM pages WHERE length(trim(dom_text)) < 50 ORDER BY code;
+
+  # Lister les URLs capturées pour une CPTS
+  SELECT url, length(dom_text) AS n_chars
+  FROM pages WHERE code='PDL-24' ORDER BY url;
+
+
+────────────────────────────────────────────────────────────────────────────────
+  ET APRÈS ? (PHASE 2)
+────────────────────────────────────────────────────────────────────────────────
+
+Une fois la Phase 1 terminée, la base contient toutes les pages brutes.
+La Phase 2 (script séparé, à venir) lira la table "pages" pour en extraire,
+via Claude, les informations structurées : équipe dirigeante, projets,
+missions, actualités, coordonnées.
+
+Règle d'or : la Phase 2 LIT la table "pages" mais ne la modifie jamais.
+On peut donc relancer l'analyse autant de fois que nécessaire sans re-scraper.
+
+================================================================================
